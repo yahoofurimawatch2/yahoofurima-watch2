@@ -1,0 +1,250 @@
+name: Yahoofurima Watch2
+
+on:
+  schedule:
+    - cron: "0,10,20,30,40,50 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yahoofurima-watch2
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Guard - skip if ran within 25min
+        run: |
+          NOW=$(date -u +%s)
+          LAST=0
+          if [ -f .github/yahoofurima_last_run_utc.txt ]; then LAST=$(cat .github/yahoofurima_last_run_utc.txt || echo 0); fi
+          DIFF=$((NOW - LAST))
+          echo "Last run diff(sec): $DIFF"
+          if [ $DIFF -lt 1500 ]; then
+            echo "Run skipped (last run $DIFF sec ago)."
+            exit 0
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install npm deps
+        run: |
+          npm i nodemailer
+          npm i -D playwright
+          npx playwright install --with-deps chromium
+
+      - name: Run Yahoofurima Watcher
+        env:
+          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          node <<'EOF'
+          import fs from 'fs';
+          import nodemailer from 'nodemailer';
+          import { chromium } from 'playwright';
+
+          const csvPath = 'targets.csv';
+          if (!fs.existsSync(csvPath)) {
+            console.log('targets.csv がありません。');
+            process.exit(0);
+          }
+
+          const lines = fs.readFileSync(csvPath, 'utf8')
+            .split('\n')
+            .map(s => s.trim())
+            .filter(Boolean);
+
+          lines.shift();
+
+          const targets = lines.map(l => {
+            const [name, keyword, max_price, min_price] = l.split(',');
+            return {
+              name,
+              keyword,
+              maxPrice: parseInt(max_price || '0', 10) || 0,
+              minPrice: parseInt(min_price || '0', 10) || 0
+            };
+          });
+
+          const seenPath = 'yahoofurima_last_seen.json';
+          let seen = {};
+          try {
+            seen = JSON.parse(fs.readFileSync(seenPath, 'utf8'));
+          } catch {}
+
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage();
+
+          const foundMsgs = [];
+
+          for (const t of targets) {
+            if (!t.keyword) continue;
+
+            const searchUrl =
+              `https://paypayfleamarket.yahoo.co.jp/search/${encodeURIComponent(t.keyword)}?sort=openTime&order=desc`;
+
+            console.log(`🔎 Checking Yahoo Furima: ${t.name}`);
+            console.log(searchUrl);
+
+            try {
+              await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
+              await page.waitForTimeout(6000);
+            } catch (e) {
+              console.log(`⚠️ ${t.name}: ページ遷移エラー (${e?.message || e})`);
+              continue;
+            }
+
+            const item = await page.evaluate(() => {
+              const anchors = [...document.querySelectorAll('a[href*="/item/"]')];
+              const items = [];
+
+              for (const a of anchors) {
+                const href = a.href;
+                if (!href || !href.includes('/item/')) continue;
+
+                let block = a;
+                for (let i = 0; i < 8; i++) {
+                  if (!block.parentElement) break;
+                  const txt = block.innerText || '';
+                  if (/¥\s?[\d,]+|円/.test(txt)) break;
+                  block = block.parentElement;
+                }
+
+                const blockText = block.innerText || a.innerText || '';
+
+                const priceMatch =
+                  blockText.match(/¥\s?([\d,]+)/) ||
+                  blockText.match(/([\d,]+)\s?円/);
+
+                if (!priceMatch) continue;
+
+                const id = href.split('/').filter(Boolean).pop()?.split(/[?#]/)[0] || href;
+                const price = parseInt(priceMatch[1].replace(/,/g, ''), 10);
+
+                if (!items.some(x => x.id === id)) {
+                  items.push({
+                    id,
+                    url: href,
+                    price,
+                    title: blockText.split('\n')[0] || ''
+                  });
+                }
+              }
+
+              return items[0] || null;
+            });
+
+            if (!item) {
+              console.log(`⚠️ ${t.name}: ヒット0件 or 取得失敗`);
+              continue;
+            }
+
+            console.log(`✅ 取得成功: ${t.name} ¥${item.price} ${item.url}`);
+
+            const isNew = seen[t.name] !== item.id;
+
+            const priceOk =
+              (t.maxPrice === 0 || item.price <= t.maxPrice) &&
+              (t.minPrice === 0 || item.price >= t.minPrice);
+
+            if (isNew && priceOk) {
+              foundMsgs.push({
+                name: t.name,
+                price: item.price,
+                url: item.url,
+                searchUrl,
+                id: item.id,
+                prev: seen[t.name] || ''
+              });
+              seen[t.name] = item.id;
+            } else {
+              if (!seen[t.name]) seen[t.name] = item.id;
+            }
+          }
+
+          await browser.close();
+
+          const linesOut = [];
+          if (foundMsgs.length) {
+            linesOut.push('## 🛎 Yahooフリマ新着検出\n');
+            for (const x of foundMsgs) {
+              linesOut.push(`- **${x.name}** 新着: ¥${x.price.toLocaleString()} → ${x.searchUrl}`);
+            }
+          } else {
+            linesOut.push('Yahooフリマ新着はありません。');
+          }
+
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY || 'summary.md', linesOut.join('\n'));
+
+          if (foundMsgs.length) {
+            const user = process.env.MAIL_USERNAME;
+            const pass = process.env.MAIL_PASSWORD;
+            const to = process.env.MAIL_TO || user;
+
+            if (user && pass) {
+              const transporter = nodemailer.createTransport({
+                host: 'smtp.gmail.com',
+                port: 465,
+                secure: true,
+                auth: { user, pass }
+              });
+
+              const text = foundMsgs.map(x =>
+                [
+                  `【${x.name}】¥${x.price}`,
+                  `検索結果(新着順): ${x.searchUrl}`,
+                  `商品詳細: ${x.url}`,
+                  `new:${x.id} prev:${x.prev}`,
+                  ''
+                ].join('\n')
+              ).join('\n');
+
+              await transporter.sendMail({
+                from: user,
+                to,
+                subject: `②Yahooフリマ 新着 ${foundMsgs.length}件`,
+                text
+              });
+
+              console.log('📧 Gmail 送信 OK');
+            } else {
+              console.log('📧 MAIL_USERNAME / MAIL_PASSWORD が未設定');
+            }
+          }
+
+          fs.writeFileSync(seenPath, JSON.stringify(seen, null, 2));
+          console.log('Yahoofurima Watch 完了');
+          EOF
+
+      - name: Save state
+        run: |
+          mkdir -p .github
+          date -u +%s > .github/yahoofurima_last_run_utc.txt
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .github/yahoofurima_last_run_utc.txt
+          if [ -f yahoofurima_last_seen.json ]; then
+            git add yahoofurima_last_seen.json
+          fi
+
+          if git diff --cached --quiet; then
+            echo "no state changes"
+          else
+            git commit -m "chore: update yahoofurima state"
+            git push
+          fi
